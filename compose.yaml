@@ -1,0 +1,31 @@
+name: ecnu-proxy
+
+services:
+  vpn:
+    image: hagb/docker-atrust@sha256:978d613b9d863a80ebaf9ea3e9cf75f2c8dfc39cadd28cac41f865a1a0eed5ca
+    hostname: ecnu-proxy
+    init: true
+    restart: "no"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.conf.default.route_localnet: "1"
+    environment:
+      USE_NOVNC: "1"
+      URLWIN: "1"
+      EXIT: "1"
+    env_file:
+      - ./.runtime/client.env
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:54631:54631"
+    volumes:
+      - ./.runtime/state/root:/root
+      - ./.runtime/state/user:/home/sangfor/.aTrust
+      - ./.runtime/state/database:/usr/share/sangfor/.aTrust/database
+      - ./.runtime/forwards.tsv:/ecnu/forwards.tsv:ro
+      - ./container/entrypoint.sh:/ecnu/entrypoint.sh:ro
+      - ./container/status.js:/ecnu/status.js:ro
+    command: ["/bin/bash", "/ecnu/entrypoint.sh"]

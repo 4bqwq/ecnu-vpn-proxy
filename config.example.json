@@ -1,0 +1,5 @@
+{
+  "proxy_port": 11080,
+  "forwards": [],
+  "check": null
+}
