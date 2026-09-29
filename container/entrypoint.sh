@@ -13,6 +13,18 @@ stop_children() {
 trap stop_children EXIT
 trap 'exit 0' TERM INT
 
+# ARP filtering checks routes without TCP ports, so the per-port rules below
+# cannot keep the Docker gateway reachable after aTrust changes the routes.
+# Upstream populates table 2 with the Docker routes before starting aTrust.
+docker_gateways=$(ip -4 route show default | awk '$1 == "default" && $2 == "via" { print $3 }' | sort -u)
+if [[ -z "$docker_gateways" ]]; then
+    echo 'Cannot find the Docker IPv4 gateway; VPN startup aborted.' >&2
+    exit 1
+fi
+while IFS= read -r gateway; do
+    ip rule add to "${gateway}/32" table 2
+done <<< "$docker_gateways"
+
 while IFS=$'\t' read -r local_port remote_host remote_port; do
     [[ -n "$local_port" ]] || continue
     ip rule add iif lo table 2 sport "$local_port"
