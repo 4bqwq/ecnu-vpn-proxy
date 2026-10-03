@@ -12,6 +12,11 @@ $script:ProjectRoot = $PSScriptRoot
 $script:Runtime = Join-Path $PSScriptRoot '.runtime'
 $script:ConfigPath = Join-Path $PSScriptRoot 'config.local.json'
 $script:LoginUrl = 'https://vpn.ecnu.edu.cn'
+$script:ClientLabels = @{
+    online = '已登录'; logout = '未登录或认证已失效'; login = '认证中'
+    offline = '客户端离线'; connect = '连接中'; disconnect = '连接中断'
+    networkUnavailable = '网络不可用'; unknown = '无法判断'
+}
 $script:Utf8 = New-Object System.Text.UTF8Encoding($false)
 # A status request is an interactive diagnostic, so individual network
 # operations have a five-second deadline. Login itself has no deadline.
@@ -234,6 +239,88 @@ function Get-ClientStatus($Container) {
     }
 }
 
+function Assert-LoginDetection($Result) {
+    $code = Get-Field $Result 'code'
+    # This client returns an empty pubkey on a successful detection. It is
+    # not an authentication token and its contents must not decide readiness.
+    $key = Get-Field (Get-Field $Result 'data') 'pubkey'
+    if (($code -isnot [int] -and $code -isnot [long]) -or $code -ne 0 -or $key -isnot [string]) {
+        throw '认证接口未返回有效的 aTrust 检测结果。'
+    }
+}
+
+function Test-LoginEndpoint($Container) {
+    # HostConfig only describes the requested ports. Inspect the ports Docker
+    # actually published, then make the same read-only detection request as
+    # the school page, directly from Windows (without the system proxy).
+    $bindings = @(Get-Field $Container.NetworkSettings.Ports '54631/tcp')
+    $published = @($bindings | Where-Object {
+        $null -ne $_ -and $_.HostIp -eq '127.0.0.1' -and $_.HostPort -eq '54631'
+    }).Count -gt 0
+    if (-not $published) {
+        return [pscustomobject]@{
+            success = $false; retryable = $true
+            detail = 'Docker 未成功发布本机认证端口 127.0.0.1:54631。'
+        }
+    }
+    $request = $null
+    $response = $null
+    $reader = $null
+    try {
+        # Use the client's certificate hostname; keep normal TLS validation.
+        $request = [Net.HttpWebRequest]::Create('https://localhost.sangfor.com.cn:54631/v1/detect')
+        $request.Proxy = $null
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = $script:NetworkTimeout
+        $request.ReadWriteTimeout = $script:NetworkTimeout
+        $request.Method = 'POST'
+        $request.ContentType = 'text/plain;charset=UTF-8;application/json'
+        $request.Referer = "$script:LoginUrl/portal/"
+        $request.Headers['Origin'] = $script:LoginUrl
+        $body = [Text.Encoding]::UTF8.GetBytes((@{
+            addr = $script:LoginUrl; type = 'web'; guid = ''; lang = 'zh-CN'
+            sdpTraceId = ''; token = ''; data = @{}
+        } | ConvertTo-Json -Compress))
+        $request.ContentLength = $body.Length
+        $stream = $request.GetRequestStream()
+        try { $stream.Write($body, 0, $body.Length) } finally { $stream.Dispose() }
+        $response = $request.GetResponse()
+        if ([int]$response.StatusCode -ne 200) { throw "认证接口返回 HTTP $([int]$response.StatusCode)。" }
+        $reader = New-Object IO.StreamReader($response.GetResponseStream())
+        # Do not log the response: only the result of detection is needed.
+        try { $result = $reader.ReadToEnd() | ConvertFrom-Json }
+        catch { throw '认证接口未返回有效的 JSON。' }
+        Assert-LoginDetection $result
+        return [pscustomobject]@{ success = $true; retryable = $false; detail = '' }
+    } catch {
+        $cause = $_.Exception
+        while ($null -ne $cause.InnerException -and $cause -isnot [Net.WebException]) { $cause = $cause.InnerException }
+        $retryable = $false
+        $detail = $cause.Message
+        if ($cause -is [Net.WebException]) {
+            $retryable = $cause.Status.ToString() -in @('ConnectFailure', 'Timeout', 'ConnectionClosed', 'ReceiveFailure', 'SendFailure')
+            $reasons = @{
+                ConnectFailure = '无法建立连接'; Timeout = '连接或响应超时'
+                ConnectionClosed = '连接被关闭'; ReceiveFailure = '接收响应失败'; SendFailure = '发送请求失败'
+                NameResolutionFailure = '无法解析本机认证域名'; TrustFailure = 'HTTPS 证书验证失败'
+                SecureChannelFailure = '无法建立 HTTPS 连接'
+            }
+            $reason = $reasons[$cause.Status.ToString()]
+            if (-not $reason) { $reason = $cause.Status.ToString() }
+            $detail = "Windows 访问认证接口 localhost.sangfor.com.cn:54631 失败：$reason（$($cause.Status)）。"
+            if ($null -ne $cause.Response) {
+                $detail = "认证接口返回 HTTP $([int]$cause.Response.StatusCode)。"
+                $cause.Response.Dispose()
+            }
+        }
+        return [pscustomobject]@{ success = $false; retryable = $retryable; detail = $detail }
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $request) { $request.Abort() }
+    }
+}
+
 function Open-Tcp([string]$Target, [int]$Port) {
     $client = New-Object Net.Sockets.TcpClient
     try {
@@ -324,6 +411,9 @@ function Read-ActiveConfig($Container) {
 function Show-VpnStatus($Config, $Container) {
     if ($null -eq $Container -or -not $Container.State.Running) {
         Write-Host '容器：未运行。请执行 .\vpn.ps1 start。'
+        if ($null -ne $Container) {
+            Write-Host "上次退出：退出码 $($Container.State.ExitCode)，OOMKilled=$($Container.State.OOMKilled)。详情见 Docker Desktop 中该容器的日志。"
+        }
         return 2
     }
     Write-Host '容器：运行中'
@@ -333,20 +423,22 @@ function Show-VpnStatus($Config, $Container) {
     }
     $active = Read-ActiveConfig $Container
     $auth = Get-ClientStatus $Container
-    $labels = @{
-        online = '已登录'; logout = '未登录或认证已失效'; login = '认证中'
-        offline = '客户端离线'; connect = '连接中'; disconnect = '连接中断'
-        networkUnavailable = '网络不可用'; unknown = '无法判断'
-    }
-    Write-Host "VPN：$($labels[$auth.state])"
+    Write-Host "VPN：$($script:ClientLabels[$auth.state])"
     if ($auth.state -eq 'unknown') { Write-Host "原因：$($auth.detail)" }
-    if ($auth.state -in @('logout', 'offline')) {
+    $endpoint = Test-LoginEndpoint $Container
+    if ($endpoint.success) {
+        Write-Host '认证接口：Windows 可直接访问本机 54631；浏览器仍需允许本站的 Apps on device 权限。'
+    } else {
+        Write-Host "认证接口：检查失败；$($endpoint.detail)"
+        Write-Host (Get-LoginEndpointAdvice $endpoint)
+    }
+    if ($endpoint.success -and $auth.state -in @('logout', 'offline')) {
         Write-Host '请执行 .\vpn.ps1 login，在学校网页完成认证。'
     }
     $proxy = Test-Socks $active.proxy_port
     if ($proxy.success) { Write-Host "SOCKS5：协议检查通过，127.0.0.1:$($active.proxy_port)" }
     else { Write-Host "SOCKS5：检查失败；$($proxy.detail)" }
-    $failed = -not $proxy.success
+    $failed = -not $proxy.success -or -not $endpoint.success
     if ($null -eq $active.check) {
         Write-Host '校内访问：未配置独立检查目标。'
     } elseif ($auth.state -ne 'online' -or -not $proxy.success) {
@@ -380,18 +472,97 @@ function Open-LoginPage {
     Write-Host "学校认证：$script:LoginUrl"
     try { Start-Process $script:LoginUrl -ErrorAction Stop | Out-Null }
     catch { Write-Host "浏览器未能自动打开，请手动访问以上网址。原因：$($_.Exception.Message)" }
-    Write-Host '网页完成认证后可以关闭页面，再执行 .\vpn.ps1 status 检查。'
+    Write-Host '若停在下载客户端页面：点地址栏左侧的网站信息，允许 Apps on device（Allow），再刷新网页。'
+    Write-Host '等待容器内 aTrust 确认登录；Ctrl+C 可结束等待，容器会保留运行。'
+}
+
+function Get-LoginEndpointAdvice($Endpoint) {
+    if ($Endpoint.retryable) {
+        return '请检查本机 54631 的端口占用及 Docker 端口转发，再执行 .\vpn.ps1 restart；此时反复网页登录不能修复认证接口。'
+    }
+    return '请先解决上述域名、HTTPS 或客户端接口错误，再运行 .\vpn.ps1 status；此时反复网页登录不能修复认证接口。'
+}
+
+function Get-RunningVpnContainer($Expected) {
+    $current = Get-VpnContainer
+    if ($null -eq $current -or -not $current.State.Running) {
+        $detail = if ($null -ne $current) { "退出码 $($current.State.ExitCode)，OOMKilled=$($current.State.OOMKilled)。" } else { '' }
+        throw "容器已停止。${detail}请检查 Docker Desktop 中该容器的日志，再执行 .\vpn.ps1 start。"
+    }
+    if ($null -ne $Expected -and $current.Id -ne $Expected.Id) {
+        throw '容器已被另一个命令替换，本次等待已停止。请执行 .\vpn.ps1 status 检查。'
+    }
+    return $current
 }
 
 function Wait-Client($Container) {
     Write-Host '等待 aTrust 启动；Ctrl+C 可结束等待，容器会保留运行。'
     while ($true) {
-        $current = Get-VpnContainer
-        if ($null -eq $current -or -not $current.State.Running) { throw '客户端启动期间容器停止。请检查 Docker Desktop 中该容器的日志。' }
+        $current = Get-RunningVpnContainer $Container
         $auth = Get-ClientStatus $current
         if ($auth.state -ne 'unknown') { return $auth }
         if ($auth.detail -notmatch 'ECONNREFUSED|ECONNRESET|TIMEOUT') { throw "无法读取客户端状态：$($auth.detail)" }
         Start-Sleep -Milliseconds 1000
+    }
+}
+
+function Invoke-Login($Container) {
+    $auth = Get-ClientStatus $Container
+    if ($auth.state -eq 'online') { Write-Host 'VPN：已登录，无需重新认证。'; return }
+    if ($auth.state -eq 'unknown') { throw "无法读取客户端状态：$($auth.detail)" }
+    if ($auth.state -in @('disconnect', 'networkUnavailable')) {
+        throw "VPN：$($script:ClientLabels[$auth.state])。请先检查客户端网络，并运行 .\vpn.ps1 status。"
+    }
+    $endpoint = Test-LoginEndpoint $Container
+    if (-not $endpoint.success) {
+        throw "认证接口不可用：$($endpoint.detail)$(Get-LoginEndpointAdvice $endpoint)"
+    }
+    Open-LoginPage
+    $previous = ''
+    while ($true) {
+        $current = Get-RunningVpnContainer $Container
+        $auth = Get-ClientStatus $current
+        if ($auth.state -eq 'online') {
+            Write-Host 'VPN：已登录（容器内 aTrust 已确认）。现在可以关闭学校网页，请勿点击“退出登录”。'
+            return
+        }
+        if ($auth.state -eq 'unknown') { throw "无法读取客户端状态：$($auth.detail)" }
+        if ($auth.state -in @('disconnect', 'networkUnavailable')) {
+            throw "VPN：$($script:ClientLabels[$auth.state])。请检查客户端网络，并运行 .\vpn.ps1 status。"
+        }
+        $endpoint = Test-LoginEndpoint $current
+        if (-not $endpoint.success) { throw "等待认证期间本机认证接口不可用：$($endpoint.detail)请执行 .\vpn.ps1 status 检查。" }
+        if ($auth.state -ne $previous) {
+            Write-Host "VPN：$($script:ClientLabels[$auth.state])；继续等待容器确认登录。"
+            $previous = $auth.state
+        }
+        Start-Sleep -Milliseconds 2000
+    }
+}
+
+function Start-CheckedContainer($Config) {
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $null = Invoke-Docker (@(Get-ComposeArguments) + @('up', '-d', '--force-recreate', 'vpn')) -Live
+        [IO.File]::WriteAllText((Join-Path $script:Runtime 'active-config.json'), ($Config | ConvertTo-Json -Depth 8), $script:Utf8)
+        $container = Get-VpnContainer
+        $null = Wait-Client $container
+        $current = Get-RunningVpnContainer $container
+        $endpoint = Test-LoginEndpoint $current
+        if (-not $endpoint.success -and $endpoint.retryable) {
+            # Docker Desktop can finish publishing just after the client starts.
+            # Confirm a failed probe before considering a single recreation.
+            Write-Host "认证接口尚未就绪：$($endpoint.detail)正在再次检查。"
+            Start-Sleep -Milliseconds 1000
+            $current = Get-RunningVpnContainer $container
+            $endpoint = Test-LoginEndpoint $current
+        }
+        if ($endpoint.success) { return $current }
+        $auth = Get-ClientStatus $current
+        if ($attempt -eq 0 -and $endpoint.retryable -and $auth.state -eq 'logout') {
+            Write-Host "认证接口检查失败：$($endpoint.detail)将重建本次刚启动的未登录容器，重试一次。"
+            continue
+        }
+        throw "认证接口检查失败：$($endpoint.detail)容器已保留，不再自动重建。$(Get-LoginEndpointAdvice $endpoint)"
     }
 }
 
@@ -414,7 +585,7 @@ function Invoke-VpnMain {
         'status' { return Show-VpnStatus $config $container }
         'login' {
             if ($null -eq $container -or -not $container.State.Running) { throw '请先执行 .\vpn.ps1 start。' }
-            Open-LoginPage
+            Invoke-Login $container
             return 0
         }
         'ssh' {
@@ -433,9 +604,8 @@ function Invoke-VpnMain {
         }
     }
     if ($Command -eq 'start' -and $null -ne $container -and $container.State.Running) {
-        $auth = Get-ClientStatus $container
-        if ($auth.state -eq 'logout') { Open-LoginPage }
-        return Show-VpnStatus $config $container
+        Invoke-Login $container
+        return Show-VpnStatus $config (Get-VpnContainer)
     }
     Assert-AvailablePorts $config $container
     # Validate before stopping a working container. Generated bind-mounted
@@ -444,11 +614,8 @@ function Invoke-VpnMain {
         $null = Invoke-Docker @('stop', $container.Id) -Live
     }
     Write-Runtime $config
-    $null = Invoke-Docker (@(Get-ComposeArguments) + @('up', '-d', '--force-recreate', 'vpn')) -Live
-    [IO.File]::WriteAllText((Join-Path $script:Runtime 'active-config.json'), ($config | ConvertTo-Json -Depth 8), $script:Utf8)
-    $container = Get-VpnContainer
-    $auth = Wait-Client $container
-    if ($auth.state -eq 'logout') { Open-LoginPage }
+    $container = Start-CheckedContainer $config
+    Invoke-Login $container
     return Show-VpnStatus $config (Get-VpnContainer)
 }
 
