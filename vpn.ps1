@@ -267,8 +267,11 @@ function Test-LoginEndpoint($Container) {
     $response = $null
     $reader = $null
     try {
-        # Use the client's certificate hostname; keep normal TLS validation.
-        $request = [Net.HttpWebRequest]::Create('https://localhost.sangfor.com.cn:54631/v1/detect')
+        # Connect to Docker's loopback binding without a DNS lookup. Host keeps
+        # the client's hostname for SNI and normal TLS certificate validation
+        # in both Windows PowerShell 5.1 and PowerShell 7.
+        $request = [Net.HttpWebRequest]::Create('https://127.0.0.1:54631/v1/detect')
+        $request.Host = 'localhost.sangfor.com.cn:54631'
         $request.Proxy = $null
         $request.AllowAutoRedirect = $false
         $request.Timeout = $script:NetworkTimeout
@@ -302,12 +305,17 @@ function Test-LoginEndpoint($Container) {
             $reasons = @{
                 ConnectFailure = '无法建立连接'; Timeout = '连接或响应超时'
                 ConnectionClosed = '连接被关闭'; ReceiveFailure = '接收响应失败'; SendFailure = '发送请求失败'
-                NameResolutionFailure = '无法解析本机认证域名'; TrustFailure = 'HTTPS 证书验证失败'
+                TrustFailure = 'HTTPS 证书验证失败'
                 SecureChannelFailure = '无法建立 HTTPS 连接'
             }
             $reason = $reasons[$cause.Status.ToString()]
-            if (-not $reason) { $reason = $cause.Status.ToString() }
-            $detail = "Windows 访问认证接口 localhost.sangfor.com.cn:54631 失败：$reason（$($cause.Status)）。"
+            if (-not $reason) {
+                # UnknownError can wrap a useful socket or TLS exception.
+                $inner = $cause
+                while ($null -ne $inner.InnerException) { $inner = $inner.InnerException }
+                $reason = $inner.Message
+            }
+            $detail = "Windows 访问本机认证接口 127.0.0.1:54631 失败：$reason（$($cause.Status)）。"
             if ($null -ne $cause.Response) {
                 $detail = "认证接口返回 HTTP $([int]$cause.Response.StatusCode)。"
                 $cause.Response.Dispose()
@@ -480,7 +488,7 @@ function Get-LoginEndpointAdvice($Endpoint) {
     if ($Endpoint.retryable) {
         return '请检查本机 54631 的端口占用及 Docker 端口转发，再执行 .\vpn.ps1 restart；此时反复网页登录不能修复认证接口。'
     }
-    return '请先解决上述域名、HTTPS 或客户端接口错误，再运行 .\vpn.ps1 status；此时反复网页登录不能修复认证接口。'
+    return '请先解决上述 HTTPS 或客户端接口错误，再运行 .\vpn.ps1 status；此时反复网页登录不能修复认证接口。'
 }
 
 function Get-RunningVpnContainer($Expected) {
