@@ -186,6 +186,7 @@ config.local.json
 | `.runtime/compose.override.json` | Docker 运行配置 |
 | `.runtime/active-config.json`    | 当前生效配置      |
 | `.runtime/state/`                | VPN 客户端数据   |
+| `.runtime/state/client-config/`  | 本机认证证书及客户端配置，重建容器后保留 |
 | `.runtime/client.env`            | 远程桌面访问密码    |
 
 ---

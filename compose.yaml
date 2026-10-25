@@ -25,6 +25,7 @@ services:
       - ./.runtime/state/root:/root
       - ./.runtime/state/user:/home/sangfor/.aTrust
       - ./.runtime/state/database:/usr/share/sangfor/.aTrust/database
+      - ./.runtime/state/client-config:/usr/share/sangfor/.aTrust/var/conf
       - ./.runtime/forwards.tsv:/ecnu/forwards.tsv:ro
       - ./container/entrypoint.sh:/ecnu/entrypoint.sh:ro
       - ./container/status.js:/ecnu/status.js:ro

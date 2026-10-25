@@ -188,6 +188,7 @@ function Write-Runtime($Config) {
     [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/root'))
     [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/user'))
     [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/database'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/client-config'))
     $envPath = Join-Path $script:Runtime 'client.env'
     if (-not (Test-Path -LiteralPath $envPath)) {
         $bytes = New-Object byte[] 6
@@ -213,6 +214,25 @@ function Write-Runtime($Config) {
     [IO.File]::WriteAllText((Join-Path $script:Runtime 'compose.override.json'), ($override | ConvertTo-Json -Depth 8), $script:Utf8)
     $forwardText = if ($rows.Count) { ($rows -join "`n") + "`n" } else { '' }
     [IO.File]::WriteAllText((Join-Path $script:Runtime 'forwards.tsv'), $forwardText, $script:Utf8)
+}
+
+function Save-ClientConfig($Container) {
+    if ($null -eq $Container) { return }
+    $destination = '/usr/share/sangfor/.aTrust/var/conf'
+    if (@(Get-Field $Container 'Mounts' | Where-Object { $null -ne $_ -and $_.Destination -eq $destination }).Count -gt 0) { return }
+    # Called after stopping the old container, before Compose replaces it.
+    # Keep a previously saved file if migration is resumed after interruption.
+    $target = Join-Path $script:Runtime 'state/client-config'
+    [void][IO.Directory]::CreateDirectory($target)
+    $staging = Join-Path $script:Runtime ('client-config-migration-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($staging)
+    try {
+        $null = Invoke-Docker @('cp', "$($Container.Id):$destination/.", $staging)
+        foreach ($item in (Get-ChildItem -LiteralPath $staging -Force)) {
+            $saved = Join-Path $target $item.Name
+            if (-not (Test-Path -LiteralPath $saved)) { Copy-Item -LiteralPath $item.FullName -Destination $saved -Recurse }
+        }
+    } finally { Remove-Item -LiteralPath $staging -Recurse -Force }
 }
 
 function ConvertFrom-ClientStatus($Response) {
@@ -249,6 +269,48 @@ function Assert-LoginDetection($Result) {
     }
 }
 
+function New-LoginCertificateCheck {
+    if (-not ('EcnuLoginCertificateCheck' -as [type])) {
+        # A .NET callback can run on a worker without a PowerShell runspace.
+        # Record validation errors in C# and preserve the normal TLS decision.
+        Add-Type -TypeDefinition @'
+using System;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public sealed class EcnuLoginCertificateCheck {
+    public bool Received;
+    public bool Expired;
+    public bool NotYetValid;
+    public bool NameMismatch;
+    public string Errors;
+    public string NotAfter;
+    public RemoteCertificateValidationCallback Callback { get { return Validate; } }
+    public bool Validate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors) {
+        Received = true;
+        Errors = errors.ToString();
+        NameMismatch = (errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0;
+        if (certificate != null) {
+            using (var leaf = new X509Certificate2(certificate)) {
+                NotAfter = leaf.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'");
+                NotYetValid = leaf.NotBefore.ToUniversalTime() > DateTime.UtcNow;
+                bool onlyLeafExpired = chain != null && errors == SslPolicyErrors.RemoteCertificateChainErrors;
+                if (chain != null) {
+                    foreach (var status in chain.ChainStatus)
+                        if (status.Status != X509ChainStatusFlags.NotTimeValid) onlyLeafExpired = false;
+                    for (int i = 1; i < chain.ChainElements.Count; i++)
+                        if (chain.ChainElements[i].ChainElementStatus.Length != 0) onlyLeafExpired = false;
+                }
+                Expired = onlyLeafExpired && leaf.NotAfter.ToUniversalTime() < DateTime.UtcNow;
+            }
+        }
+        return errors == SslPolicyErrors.None;
+    }
+}
+'@
+    }
+    return New-Object EcnuLoginCertificateCheck
+}
+
 function Test-LoginEndpoint($Container) {
     # HostConfig only describes the requested ports. Inspect the ports Docker
     # actually published, then make the same read-only detection request as
@@ -266,6 +328,7 @@ function Test-LoginEndpoint($Container) {
     $request = $null
     $response = $null
     $reader = $null
+    $certificateCheck = New-LoginCertificateCheck
     try {
         # Connect to Docker's loopback binding without a DNS lookup. Host keeps
         # the client's hostname for SNI and normal TLS certificate validation
@@ -273,6 +336,7 @@ function Test-LoginEndpoint($Container) {
         $request = [Net.HttpWebRequest]::Create('https://127.0.0.1:54631/v1/detect')
         $request.Host = 'localhost.sangfor.com.cn:54631'
         $request.Proxy = $null
+        $request.ServerCertificateValidationCallback = $certificateCheck.Callback
         $request.AllowAutoRedirect = $false
         $request.Timeout = $script:NetworkTimeout
         $request.ReadWriteTimeout = $script:NetworkTimeout
@@ -296,6 +360,21 @@ function Test-LoginEndpoint($Container) {
         Assert-LoginDetection $result
         return [pscustomobject]@{ success = $true; retryable = $false; detail = '' }
     } catch {
+        if ($certificateCheck.Expired) {
+            return [pscustomobject]@{
+                success = $false; retryable = $false; kind = 'certificateExpired'
+                detail = "本机认证证书已过期（到期时间：$($certificateCheck.NotAfter)），需要更新证书。"
+            }
+        }
+        if ($certificateCheck.Received -and $certificateCheck.Errors -ne 'None') {
+            $reason = '证书信任检查失败'
+            if ($certificateCheck.NameMismatch) { $reason = '证书域名与 localhost.sangfor.com.cn 不匹配' }
+            elseif ($certificateCheck.NotYetValid) { $reason = '证书尚未生效，需要核对系统时间和证书有效期' }
+            return [pscustomobject]@{
+                success = $false; retryable = $false; kind = 'certificateInvalid'
+                detail = "本机认证接口 HTTPS 校验失败：$reason（$($certificateCheck.Errors)）。"
+            }
+        }
         $cause = $_.Exception
         while ($null -ne $cause.InnerException -and $cause -isnot [Net.WebException]) { $cause = $cause.InnerException }
         $retryable = $false
@@ -333,7 +412,7 @@ function Open-Tcp([string]$Target, [int]$Port) {
     $client = New-Object Net.Sockets.TcpClient
     try {
         $task = $client.ConnectAsync($Target, $Port)
-        if (-not $task.Wait($script:NetworkTimeout)) { throw 'TCP 连接超时。' }
+        if (-not $task.Wait($script:NetworkTimeout)) { throw (New-Object TimeoutException('TCP 连接超时。')) }
         $stream = $client.GetStream()
         $stream.ReadTimeout = $script:NetworkTimeout
         $stream.WriteTimeout = $script:NetworkTimeout
@@ -344,66 +423,170 @@ function Open-Tcp([string]$Target, [int]$Port) {
 function Read-Exact($Stream, [int]$Count) {
     $buffer = New-Object byte[] $Count
     $offset = 0
-    while ($offset -lt $Count) {
-        $read = $Stream.Read($buffer, $offset, $Count - $offset)
-        if ($read -eq 0) { throw '连接在协议响应完成前关闭。' }
-        $offset += $read
+    try {
+        while ($offset -lt $Count) {
+            $read = $Stream.Read($buffer, $offset, $Count - $offset)
+            if ($read -eq 0) { throw (New-Object IO.EndOfStreamException('连接被对端关闭。')) }
+            $offset += $read
+        }
+    } catch {
+        # Distinguish no reply from a reply that stopped partway through.
+        $_.Exception.Data['ecnu-proxy.bytes-read'] = $offset
+        throw
     }
     return ,$buffer
 }
 
+function Get-NetworkFailure([Exception]$Exception) {
+    $cause = $Exception
+    $received = 0
+    while ($true) {
+        if ($cause.Data.Contains('ecnu-proxy.bytes-read')) { $received = [int]$cause.Data['ecnu-proxy.bytes-read'] }
+        if ($null -eq $cause.InnerException) { break }
+        $cause = $cause.InnerException
+    }
+    $kind = 'other'
+    $reason = $cause.Message
+    if ($cause -is [TimeoutException]) {
+        $kind = 'timeout'; $reason = '超时'
+    } elseif ($cause -is [IO.EndOfStreamException]) {
+        $kind = 'closed'; $reason = '连接被对端关闭'
+    } elseif ($cause -is [Net.Sockets.SocketException]) {
+        switch ($cause.SocketErrorCode.ToString()) {
+            'TimedOut' { $kind = 'timeout'; $reason = '超时' }
+            # A synchronous NetworkStream read can report WouldBlock when its
+            # configured read timeout expires.
+            'WouldBlock' { $kind = 'timeout'; $reason = '超时' }
+            'ConnectionReset' { $kind = 'closed'; $reason = '连接被对端关闭' }
+            'ConnectionAborted' { $kind = 'closed'; $reason = '连接被关闭' }
+            'NetworkReset' { $kind = 'closed'; $reason = '连接被关闭' }
+            'ConnectionRefused' { $reason = '连接被拒绝' }
+            'NetworkUnreachable' { $reason = '网络不可达' }
+            'HostUnreachable' { $reason = '目标主机不可达' }
+            'HostNotFound' { $reason = '域名无法解析' }
+        }
+    }
+    return [pscustomobject]@{ kind = $kind; reason = $reason; received = $received }
+}
+
 function Test-Socks([int]$Port, [string]$Target = '', [int]$TargetPort = 0) {
     $client = $null
+    $stage = 'connect'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         $client = Open-Tcp '127.0.0.1' $Port
         $stream = $client.GetStream()
         $hello = [byte[]]@(5, 1, 0)
+        $stage = 'sendHello'; $timer.Restart()
         $stream.Write($hello, 0, $hello.Length)
+        $stage = 'hello'; $timer.Restart()
         $reply = Read-Exact $stream 2
-        if ($reply[0] -ne 5 -or $reply[1] -ne 0) { throw 'SOCKS5 未接受无密码认证。' }
+        $stage = 'protocol'
+        if ($reply[0] -ne 5) { throw '代理回复格式不正确：SOCKS5 版本不是 5。' }
+        if ($reply[1] -ne 0) { throw '代理未接受无密码的 SOCKS5 握手。' }
         if ($Target) {
             # ATYP=DOMAIN keeps campus DNS resolution inside the container.
             $address = [Text.Encoding]::ASCII.GetBytes($Target)
             $packet = [byte[]](@(5, 1, 0, 3, $address.Length) + @($address) + @(($TargetPort -shr 8), ($TargetPort -band 255)))
+            $stage = 'sendTarget'; $timer.Restart()
             $stream.Write($packet, 0, $packet.Length)
+            $stage = 'target'; $timer.Restart()
             $response = Read-Exact $stream 4
-            if ($response[0] -ne 5 -or $response[1] -ne 0 -or $response[2] -ne 0) {
-                throw "SOCKS5 目标连接失败，响应码 $($response[1])。"
+            $stage = 'protocol'
+            if ($response[0] -ne 5 -or $response[2] -ne 0) {
+                throw '代理回复格式不正确：SOCKS5 版本或保留字段无效。'
             }
+            if ($response[1] -ne 0) {
+                $reasons = @{
+                    1 = '代理处理连接请求失败'; 2 = '代理禁止连接此目标'
+                    3 = '代理报告目标网络不可达'; 4 = '代理报告目标主机不可达'
+                    5 = '代理报告目标端口拒绝连接'; 6 = '代理报告目标连接的生存时间已耗尽'
+                    7 = '代理不支持此连接请求'; 8 = '代理不支持目标地址类型'
+                }
+                $reason = $reasons[[int]$response[1]]
+                if (-not $reason) { $reason = '代理返回未知的目标连接结果' }
+                throw "校内连接检查失败：$reason（响应码 $($response[1])）。"
+            }
+            $stage = 'tail'; $timer.Restart()
             switch ($response[3]) {
                 1 { $null = Read-Exact $stream 4 }
                 3 { $length = Read-Exact $stream 1; $null = Read-Exact $stream $length[0] }
                 4 { $null = Read-Exact $stream 16 }
-                default { throw 'SOCKS5 返回未知地址格式。' }
+                default { $stage = 'protocol'; throw '代理回复格式不正确：返回了未知地址类型。' }
             }
             $null = Read-Exact $stream 2
         }
         return [pscustomobject]@{ success = $true; detail = '' }
-    } catch { return [pscustomobject]@{ success = $false; detail = $_.Exception.Message } }
+    } catch {
+        $failure = Get-NetworkFailure $_.Exception
+        $limit = ($script:NetworkTimeout / 1000.0).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture)
+        $readReason = if ($failure.kind -eq 'timeout') { '读取超时' } else { $failure.reason }
+        $detail = switch ($stage) {
+            'connect' { "无法连接本机代理 127.0.0.1:${Port}：$($failure.reason)。" }
+            'sendHello' { "发送 SOCKS5 握手请求失败：$($failure.reason)。" }
+            'hello' {
+                if ($failure.received -gt 0) { "SOCKS5 握手回复未接收完整：$readReason。" }
+                elseif ($failure.kind -eq 'timeout') { "代理未回应：已连接本机端口，但 $limit 秒内未收到 SOCKS5 握手回复。" }
+                else { "读取 SOCKS5 握手回复失败：$($failure.reason)。" }
+            }
+            'sendTarget' { "发送校内连接检查请求失败：$($failure.reason)。" }
+            'target' {
+                if ($failure.received -gt 0) { "代理回复未接收完整：$readReason。" }
+                elseif ($failure.kind -eq 'timeout') { "校内连接检查超时：代理在 $limit 秒内没有回复。" }
+                else { "读取校内连接检查结果失败：$($failure.reason)。" }
+            }
+            'tail' { "代理回复未接收完整：$readReason。" }
+            'protocol' { $failure.reason }
+        }
+        if ($failure.kind -eq 'timeout') {
+            $elapsed = $timer.Elapsed.TotalSeconds.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+            $detail += "（本步骤耗时 $elapsed 秒）"
+        }
+        return [pscustomobject]@{ success = $false; detail = $detail }
+    }
     finally { if ($null -ne $client) { $client.Dispose() } }
 }
 
 function Test-Forward($Item) {
     $client = $null
+    $stage = 'connect'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         $client = Open-Tcp '127.0.0.1' $Item.local_port
         if ($Item.ssh_user) {
             $stream = $client.GetStream()
             $line = New-Object Text.StringBuilder
+            $stage = 'ssh'; $timer.Restart()
             # SSH RFC 4253 limits the identification string to 255 characters.
             while ($line.Length -lt 255) {
                 $value = $stream.ReadByte()
-                if ($value -lt 0) { throw 'SSH 目标在发送标识前关闭连接。' }
+                if ($value -lt 0) { throw (New-Object IO.EndOfStreamException('连接被对端关闭。')) }
                 if ($value -eq 10) {
+                    $stage = 'protocol'
                     if (-not $line.ToString().StartsWith('SSH-')) { throw '目标未返回 SSH 标识。' }
                     return [pscustomobject]@{ success = $true; detail = '收到 SSH 响应' }
                 }
                 [void]$line.Append([char]$value)
             }
+            $stage = 'protocol'
             throw '目标未返回有效的 SSH 标识。'
         }
         return [pscustomobject]@{ success = $true; detail = '本机转发端口接受连接' }
-    } catch { return [pscustomobject]@{ success = $false; detail = $_.Exception.Message } }
+    } catch {
+        $failure = Get-NetworkFailure $_.Exception
+        $limit = ($script:NetworkTimeout / 1000.0).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture)
+        if ($stage -eq 'connect') {
+            $detail = "无法连接本机转发端口 127.0.0.1:$($Item.local_port)：$($failure.reason)。"
+        } elseif ($stage -eq 'protocol') { $detail = $failure.reason }
+        elseif ($failure.kind -eq 'timeout') {
+            $detail = "SSH 响应超时：已连接本机转发端口，但连续 $limit 秒未收到 SSH 数据。"
+        } else { $detail = "读取 SSH 响应失败：$($failure.reason)。" }
+        if ($failure.kind -eq 'timeout') {
+            $elapsed = $timer.Elapsed.TotalSeconds.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)
+            $detail += "（本步骤耗时 $elapsed 秒）"
+        }
+        return [pscustomobject]@{ success = $false; detail = $detail }
+    }
     finally { if ($null -ne $client) { $client.Dispose() } }
 }
 
@@ -485,10 +668,13 @@ function Open-LoginPage {
 }
 
 function Get-LoginEndpointAdvice($Endpoint) {
+    if ((Get-Field $Endpoint 'kind') -eq 'certificateExpired') {
+        return 'start 或 login 会自动更新认证证书；status 只检查当前情况。'
+    }
     if ($Endpoint.retryable) {
         return '请检查本机 54631 的端口占用及 Docker 端口转发，再执行 .\vpn.ps1 restart；此时反复网页登录不能修复认证接口。'
     }
-    return '请先解决上述 HTTPS 或客户端接口错误，再运行 .\vpn.ps1 status；此时反复网页登录不能修复认证接口。'
+    return '认证接口尚未通过 HTTPS 或协议检查，学校网页暂时无法把认证交给客户端。'
 }
 
 function Get-RunningVpnContainer($Expected) {
@@ -514,6 +700,126 @@ function Wait-Client($Container) {
     }
 }
 
+function Get-CertificateUpdate($Container) {
+    $startedAt = $Container.State.StartedAt
+    if ($startedAt -is [datetime]) { $startedAt = $startedAt.ToUniversalTime().ToString('o') }
+    $data = Invoke-Docker @('exec', '-e', 'ELECTRON_RUN_AS_NODE=1', $Container.Id,
+        '/usr/share/sangfor/aTrust/aTrustTray', '/ecnu/status.js', 'certificate-update', [string]$startedAt)
+    $update = $data | ConvertFrom-Json
+    if ((Get-Field $update 'state') -notin @('pending', 'ready', 'failed', 'unknown')) {
+        throw '无法识别客户端的证书更新状态。'
+    }
+    return $update
+}
+
+function Get-CertificateUpdateReason($Update) {
+    $reasons = @{
+        DOWNLOAD_TIMEOUT = '下载超时'; DOWNLOAD_TLS = '下载服务器的 HTTPS 连接失败'
+        DOWNLOAD_DNS = '无法解析证书下载地址'; DOWNLOAD_CONNECT = '无法连接证书下载服务器'
+        DOWNLOADED_CERTIFICATE_EXPIRED = '下载的证书不在有效期内'; UPDATE_FAILED = '客户端证书更新失败'
+        NO_UPDATE_EVENT = '暂未读取到本次客户端的证书更新结果'
+    }
+    $reason = $reasons[[string](Get-Field $Update 'reason')]
+    if (-not $reason) { throw '客户端证书更新状态缺少可识别的原因。' }
+    return $reason
+}
+
+function New-VpnContainer($Config) {
+    $null = Invoke-Docker (@(Get-ComposeArguments) + @('up', '-d', '--force-recreate', 'vpn')) -Live
+    [IO.File]::WriteAllText((Join-Path $script:Runtime 'active-config.json'), ($Config | ConvertTo-Json -Depth 8), $script:Utf8)
+    $container = Get-VpnContainer
+    $null = Wait-Client $container
+    return Get-RunningVpnContainer $container
+}
+
+function Restart-PendingContainer($Container) {
+    $current = Get-RunningVpnContainer $Container
+    # A user may finish authenticating while the retry delay is running.
+    # Only the explicitly logged-out state permits automatic replacement.
+    $auth = Get-ClientStatus $current
+    if ($auth.state -ne 'logout') { return $current }
+    $config = Read-ActiveConfig $current
+    Assert-AvailablePorts $config $current
+    $current = Get-RunningVpnContainer $current
+    if ((Get-ClientStatus $current).state -ne 'logout') { return $current }
+    $null = Invoke-Docker @('stop', $current.Id)
+    Save-ClientConfig $current
+    Write-Runtime $config
+    return New-VpnContainer $config
+}
+
+function Wait-LoginEndpoint($Container, [switch]$NewContainer) {
+    $current = $Container
+    $publicationRetries = 0
+    $certificateWait = $false
+    $retryDelay = 5
+    $lastNotice = ''
+    while ($true) {
+        $current = Get-RunningVpnContainer $current
+        $endpoint = Test-LoginEndpoint $current
+        if ($endpoint.success) {
+            if ($certificateWait) { Write-Host '认证证书更新完成，Windows HTTPS 检查通过。' }
+            return $current
+        }
+        if ((Get-Field $endpoint 'kind') -eq 'certificateExpired') {
+            $auth = Get-ClientStatus $current
+            if ($auth.state -eq 'online') {
+                Write-Host 'VPN 已登录；认证证书已过期，本次保留现有连接。'
+                return $current
+            }
+            if ($auth.state -eq 'unknown') { throw "无法读取客户端状态：$($auth.detail)" }
+            if (-not $certificateWait) {
+                Write-Host '本机认证证书已过期，正在等待 aTrust 更新；Ctrl+C 可结束等待，容器和数据会保留。'
+                $certificateWait = $true
+            }
+            $update = Get-CertificateUpdate $current
+            if ($update.state -eq 'failed' -and $auth.state -eq 'logout') {
+                $reason = Get-CertificateUpdateReason $update
+                Write-Host "证书更新失败：$reason。将在 $retryDelay 秒后自动重试。"
+                Start-Sleep -Seconds $retryDelay
+                $current = Get-RunningVpnContainer $current
+                # Recheck both the endpoint and the updater after waiting:
+                # a delayed official update may already have recovered.
+                $latest = Test-LoginEndpoint $current
+                if ($latest.success) { continue }
+                if ((Get-Field $latest 'kind') -ne 'certificateExpired') {
+                    throw "认证接口不可用：$($latest.detail)"
+                }
+                if ((Get-CertificateUpdate $current).state -ne 'failed') { continue }
+                Write-Host '正在重试证书更新；仅重新启动本项目尚未登录的客户端。'
+                $current = Restart-PendingContainer $current
+                $NewContainer = $true
+                $retryDelay = [Math]::Min(30, $retryDelay * 2)
+                $lastNotice = ''
+                continue
+            }
+            if ($update.state -eq 'unknown') {
+                $notice = Get-CertificateUpdateReason $update
+                if ($notice -ne $lastNotice) { Write-Host "$notice，继续等待。"; $lastNotice = $notice }
+            }
+            Start-Sleep -Seconds 2
+            continue
+        }
+        # Preserve the existing single retry for a newly published Docker
+        # port. Other TLS/protocol errors never trigger certificate retries.
+        if ($NewContainer -and $endpoint.retryable) {
+            Write-Host "认证接口尚未就绪：$($endpoint.detail)正在再次检查。"
+            Start-Sleep -Milliseconds 1000
+            $current = Get-RunningVpnContainer $current
+            $endpoint = Test-LoginEndpoint $current
+            if ($endpoint.success) { return $current }
+            if ((Get-Field $endpoint 'kind') -eq 'certificateExpired') { continue }
+            if ($endpoint.retryable -and $publicationRetries -eq 0 -and (Get-ClientStatus $current).state -eq 'logout') {
+                $publicationRetries++
+                Write-Host '本次启动的认证端口仍不可用，将重建未登录容器重试一次。'
+                $current = Restart-PendingContainer $current
+                continue
+            }
+        }
+        throw "认证接口不可用：$($endpoint.detail)容器已保留，不再自动重建。$(Get-LoginEndpointAdvice $endpoint)"
+    }
+}
+
 function Invoke-Login($Container) {
     $auth = Get-ClientStatus $Container
     if ($auth.state -eq 'online') { Write-Host 'VPN：已登录，无需重新认证。'; return }
@@ -521,10 +827,8 @@ function Invoke-Login($Container) {
     if ($auth.state -in @('disconnect', 'networkUnavailable')) {
         throw "VPN：$($script:ClientLabels[$auth.state])。请先检查客户端网络，并运行 .\vpn.ps1 status。"
     }
-    $endpoint = Test-LoginEndpoint $Container
-    if (-not $endpoint.success) {
-        throw "认证接口不可用：$($endpoint.detail)$(Get-LoginEndpointAdvice $endpoint)"
-    }
+    $Container = Wait-LoginEndpoint $Container
+    if ((Get-ClientStatus $Container).state -eq 'online') { Write-Host 'VPN：已登录，无需重新认证。'; return }
     Open-LoginPage
     $previous = ''
     while ($true) {
@@ -549,29 +853,8 @@ function Invoke-Login($Container) {
 }
 
 function Start-CheckedContainer($Config) {
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        $null = Invoke-Docker (@(Get-ComposeArguments) + @('up', '-d', '--force-recreate', 'vpn')) -Live
-        [IO.File]::WriteAllText((Join-Path $script:Runtime 'active-config.json'), ($Config | ConvertTo-Json -Depth 8), $script:Utf8)
-        $container = Get-VpnContainer
-        $null = Wait-Client $container
-        $current = Get-RunningVpnContainer $container
-        $endpoint = Test-LoginEndpoint $current
-        if (-not $endpoint.success -and $endpoint.retryable) {
-            # Docker Desktop can finish publishing just after the client starts.
-            # Confirm a failed probe before considering a single recreation.
-            Write-Host "认证接口尚未就绪：$($endpoint.detail)正在再次检查。"
-            Start-Sleep -Milliseconds 1000
-            $current = Get-RunningVpnContainer $container
-            $endpoint = Test-LoginEndpoint $current
-        }
-        if ($endpoint.success) { return $current }
-        $auth = Get-ClientStatus $current
-        if ($attempt -eq 0 -and $endpoint.retryable -and $auth.state -eq 'logout') {
-            Write-Host "认证接口检查失败：$($endpoint.detail)将重建本次刚启动的未登录容器，重试一次。"
-            continue
-        }
-        throw "认证接口检查失败：$($endpoint.detail)容器已保留，不再自动重建。$(Get-LoginEndpointAdvice $endpoint)"
-    }
+    $container = New-VpnContainer $Config
+    return Wait-LoginEndpoint $container -NewContainer
 }
 
 function Invoke-VpnMain {
@@ -621,6 +904,7 @@ function Invoke-VpnMain {
     if ($null -ne $container -and $container.State.Running) {
         $null = Invoke-Docker @('stop', $container.Id) -Live
     }
+    Save-ClientConfig $container
     Write-Runtime $config
     $container = Start-CheckedContainer $config
     Invoke-Login $container
