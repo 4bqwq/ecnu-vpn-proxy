@@ -165,6 +165,44 @@ function Get-DesiredPorts($Config) {
     return @(18080, 54631, $Config.proxy_port) + @($Config.forwards | ForEach-Object { $_.local_port })
 }
 
+function Get-PortConflict([int]$Port, $Container) {
+    $ids = Invoke-Docker @('ps', '-q', '--filter', "publish=$Port")
+    if (-not [string]::IsNullOrWhiteSpace($ids)) {
+        $entries = (Invoke-Docker (@('inspect') + @($ids -split '\s+' | Where-Object { $_ }))) | ConvertFrom-Json
+        foreach ($entry in @($entries)) {
+            if ($null -ne $Container -and $entry.Id -eq $Container.Id) { continue }
+            foreach ($binding in $entry.NetworkSettings.Ports.PSObject.Properties) {
+                foreach ($endpoint in @($binding.Value)) {
+                    if ($null -ne $endpoint -and [int]$endpoint.HostPort -eq $Port -and
+                        $endpoint.HostIp -in @('', '0.0.0.0', '127.0.0.1', '::', '::1')) {
+                        return "Docker 容器 $($entry.Name.TrimStart('/'))（$($entry.Id.Substring(0, 12))）"
+                    }
+                }
+            }
+        }
+    }
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $connections = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {
+            $_.LocalPort -eq $Port -and $_.LocalAddress -in @('0.0.0.0', '127.0.0.1', '::', '::1')
+        })
+        if ($connections.Count) {
+            $owners = foreach ($ownerId in @($connections.OwningProcess | Sort-Object -Unique)) {
+                $process = Get-Process -Id $ownerId -ErrorAction SilentlyContinue
+                if ($null -ne $process) { "$($process.ProcessName)（PID $ownerId）" }
+                else { "PID $ownerId（进程已结束或无法读取名称）" }
+            }
+            return ($owners -join '、')
+        }
+    } else {
+        foreach ($endpoint in [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()) {
+            if ($endpoint.Port -eq $Port -and $endpoint.Address.ToString() -in @('0.0.0.0', '127.0.0.1', '::', '::1')) {
+                return 'TCP 监听程序（当前系统不提供 Windows 进程查询）'
+            }
+        }
+    }
+    return $null
+}
+
 function Assert-AvailablePorts($Config, $Container) {
     $owned = @()
     if ($null -ne $Container -and $Container.State.Running) {
@@ -179,7 +217,16 @@ function Assert-AvailablePorts($Config, $Container) {
         $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $port)
         $listener.Server.ExclusiveAddressUse = $true
         try { $listener.Start() }
-        catch { throw "本机端口 $port 已被占用或不允许绑定。请释放该端口，或修改私人配置中的对应端口。认证端口 54631 和桌面端口 18080 固定。" }
+        catch {
+            $failure = $_.Exception.GetBaseException()
+            if ($failure -isnot [Net.Sockets.SocketException]) { throw }
+            if ($failure.SocketErrorCode -ne [Net.Sockets.SocketError]::AddressAlreadyInUse) {
+                throw "本机端口 $port 预检失败：$($failure.Message)（错误码 $($failure.NativeErrorCode)，$($failure.SocketErrorCode)）。"
+            }
+            $conflict = Get-PortConflict $port $Container
+            if ($conflict) { throw "本机端口 $port 已被 $conflict 占用。请关闭对应服务或修改私人配置；当前 VPN 容器尚未停止。" }
+            Write-Host "端口 $port：Windows 预检返回地址占用（$($failure.NativeErrorCode)），未找到占用者；继续尝试 Docker 启动。"
+        }
         finally { $listener.Stop() }
     }
 }

@@ -374,12 +374,19 @@ Check 'Generated forwards leave the upstream browser login relay available' {
     }
 }
 Check 'Conflicting ports are rejected before any container is stopped' {
+    function Invoke-Docker { param([string[]]$Arguments) return '' }
+    # Socket enumeration can omit live listeners on the affected Windows/WSL
+    # host. Supply a confirmed owner here; the next check covers no owner.
+    function Get-NetTCPConnection {
+        return [pscustomobject]@{ LocalPort = $port; LocalAddress = '127.0.0.1'; OwningProcess = $PID }
+    }
     $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
         $port = $listener.LocalEndpoint.Port
         $c = Parse-Config ('{"proxy_port":' + $port + ',"forwards":[]}')
         $ownedFixedPorts = [pscustomobject]@{
+            Id = 'port-test-container'
             State = [pscustomobject]@{ Running = $true }
             NetworkSettings = [pscustomobject]@{ Ports = [pscustomobject]@{
                 '8080/tcp' = @([pscustomobject]@{ HostPort = '18080' })
@@ -387,7 +394,67 @@ Check 'Conflicting ports are rejected before any container is stopped' {
             } }
         }
         Assert-Throws { Assert-AvailablePorts $c $ownedFixedPorts } ([string]$port)
+        $script:Command = 'restart'
+        $script:stopAttempted = $false
+        function Assert-Docker { }
+        function Get-VpnContainer { return $ownedFixedPorts }
+        function Read-VpnConfig { return $c }
+        function Invoke-Docker { $script:stopAttempted = $true; throw 'Must not stop a working VPN' }
+        function Get-PortConflict { return "fixture process (PID $PID)" }
+        Assert-Throws { Invoke-VpnMain } "PID $PID"
+        Assert-True (-not $script:stopAttempted)
     } finally { $listener.Stop() }
+}
+Check 'An unconfirmed address conflict reaches Docker and preserves Docker errors' {
+    $listener = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $port = $listener.LocalEndpoint.Port
+        $c = Parse-Config ('{"proxy_port":' + $port + ',"forwards":[]}')
+        $owned = [pscustomobject]@{
+            Id = 'port-test-container'
+            State = [pscustomobject]@{ Running = $true }
+            NetworkSettings = [pscustomobject]@{ Ports = [pscustomobject]@{
+                '8080/tcp' = @([pscustomobject]@{ HostPort = '18080' })
+                '54631/tcp' = @([pscustomobject]@{ HostPort = '54631' })
+            } }
+        }
+        function Get-PortConflict { return $null }
+        $output = @(Assert-AvailablePorts $c $owned 6>&1)
+        Assert-True (($output -join "`n") -match '未找到占用者；继续尝试 Docker 启动')
+        $script:Command = 'restart'
+        $script:dockerStartAttempted = $false
+        function Assert-Docker { }
+        function Get-VpnContainer { return $owned }
+        function Read-VpnConfig { return $c }
+        function Invoke-Docker { return '' }
+        function Save-ClientConfig { }
+        function Write-Runtime { }
+        function Start-CheckedContainer { $script:dockerStartAttempted = $true; throw 'Docker bind error fixture' }
+        Assert-Throws { Invoke-VpnMain } 'Docker bind error fixture'
+        Assert-True $script:dockerStartAttempted
+    } finally { $listener.Stop() }
+}
+Check 'Port conflicts identify the Docker container publishing the host port' {
+    function Invoke-Docker {
+        param([string[]]$Arguments)
+        if ($Arguments[0] -eq 'ps') { return 'abcdef0123456789' }
+        return '[{"Id":"abcdef0123456789","Name":"/another-service","NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"}]}}}]'
+    }
+    Assert-True ((Get-PortConflict 18080 $null) -match 'another-service.*abcdef012345')
+}
+Check 'Running container ports do not undergo the exclusive binding check' {
+    $c = Parse-Config '{"proxy_port":11080,"forwards":[]}'
+    $container = [pscustomobject]@{
+        State = [pscustomobject]@{ Running = $true }
+        NetworkSettings = [pscustomobject]@{ Ports = [pscustomobject]@{
+            '8080/tcp' = @([pscustomobject]@{ HostPort = '18080' })
+            '54631/tcp' = @([pscustomobject]@{ HostPort = '54631' })
+            '1080/tcp' = @([pscustomobject]@{ HostPort = '11080' })
+        } }
+    }
+    function Get-PortConflict { throw 'Owned ports must not be treated as conflicts' }
+    Assert-AvailablePorts $c $container
 }
 function New-ContainerFixture {
     return [pscustomobject]@{
