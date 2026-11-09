@@ -231,6 +231,19 @@ function Assert-AvailablePorts($Config, $Container) {
     }
 }
 
+function Write-RecoveryTargets($Config) {
+    $targets = @()
+    if ($null -ne $Config.check) {
+        $targets += @{ host = $Config.check.host; port = $Config.check.port; ssh = $false }
+    }
+    foreach ($item in $Config.forwards) {
+        $targets += @{ host = $item.host; port = $item.remote_port; ssh = [bool]$item.ssh_user }
+    }
+    # Private addresses stay with the other generated runtime files.
+    $text = @{ targets = $targets } | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText((Join-Path $script:Runtime 'recovery-targets.json'), $text, $script:Utf8)
+}
+
 function Write-Runtime($Config) {
     [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/root'))
     [void][IO.Directory]::CreateDirectory((Join-Path $script:Runtime 'state/user'))
@@ -261,6 +274,7 @@ function Write-Runtime($Config) {
     [IO.File]::WriteAllText((Join-Path $script:Runtime 'compose.override.json'), ($override | ConvertTo-Json -Depth 8), $script:Utf8)
     $forwardText = if ($rows.Count) { ($rows -join "`n") + "`n" } else { '' }
     [IO.File]::WriteAllText((Join-Path $script:Runtime 'forwards.tsv'), $forwardText, $script:Utf8)
+    Write-RecoveryTargets $Config
 }
 
 function Save-ClientConfig($Container) {
@@ -304,6 +318,16 @@ function Get-ClientStatus($Container) {
     } catch {
         return [pscustomobject]@{ state = 'unknown'; detail = $_.Exception.Message }
     }
+}
+
+function Get-RecoverySummary($Container) {
+    try {
+        $data = Invoke-Docker @('exec', '-e', 'ELECTRON_RUN_AS_NODE=1', $Container.Id,
+            '/usr/share/sangfor/aTrust/aTrustTray', '/ecnu/recovery.js', 'status')
+        $summary = Get-Field ($data | ConvertFrom-Json) 'summary'
+        if ($summary -isnot [string] -or -not $summary) { throw '监控未返回检查结果。' }
+        return $summary
+    } catch { return "无法读取监控状态：$($_.Exception.Message)" }
 }
 
 function Assert-LoginDetection($Result) {
@@ -663,6 +687,7 @@ function Show-VpnStatus($Config, $Container) {
     $auth = Get-ClientStatus $Container
     Write-Host "VPN：$($script:ClientLabels[$auth.state])"
     if ($auth.state -eq 'unknown') { Write-Host "原因：$($auth.detail)" }
+    Write-Host "自动恢复：$(Get-RecoverySummary $Container)"
     $endpoint = Test-LoginEndpoint $Container
     if ($endpoint.success) {
         Write-Host '认证接口：Windows 可直接访问本机 54631；浏览器仍需允许本站的 Apps on device 权限。'

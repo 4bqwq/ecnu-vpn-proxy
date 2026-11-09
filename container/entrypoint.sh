@@ -50,6 +50,10 @@ done < /ecnu/forwards.tsv
 
 /usr/local/bin/start.sh &
 children+=("$!")
+# A monitor failure is reported by status; it must not stop a usable VPN.
+services=("${children[@]}")
+ELECTRON_RUN_AS_NODE=1 /usr/share/sangfor/aTrust/aTrustTray /ecnu/recovery.js &
+children+=("$!")
 # A dead forwarder must be visible as a failed container, not a silent loss
 # of one published port. Successful client shutdown is also propagated.
-wait -n "${children[@]}"
+wait -n "${services[@]}"

@@ -621,6 +621,7 @@ Check 'Status distinguishes a broken callback from a login requirement without S
     function Read-ActiveConfig { return $config }
     function Get-ClientStatus { return [pscustomobject]@{ state = 'logout'; detail = '' } }
     function Test-Socks { return [pscustomobject]@{ success = $true } }
+    function Get-RecoverySummary { return '等待校园认证；当前不触发数据通道重建。' }
     $output = @(Show-VpnStatus $config (New-ContainerFixture) 6>&1)
     Assert-True ($output[-1] -eq 1)
     Assert-True (($output -join "`n") -match 'Docker 未成功发布')
@@ -768,6 +769,7 @@ Check 'Status reports certificate expiration without starting automatic recovery
     function Test-Socks { return [pscustomobject]@{ success = $true } }
     function Test-LoginEndpoint { return Expired-Endpoint }
     function Get-CertificateUpdate { throw 'Status must not wait for an update' }
+    function Get-RecoverySummary { return '等待校园认证；当前不触发数据通道重建。' }
     function Restart-PendingContainer { throw 'Status must not change the container' }
     $output = @(Show-VpnStatus $config (New-ContainerFixture) 6>&1)
     Assert-True ($output[-1] -eq 1 -and ($output -join "`n") -match '自动更新认证证书')
@@ -781,5 +783,29 @@ Check 'Certificate log filtering receives an unambiguous UTC container start tim
         return '{"state":"failed","reason":"DOWNLOAD_TIMEOUT"}'
     }
     Assert-True ((Get-CertificateUpdate $c).state -eq 'failed')
+}
+Check 'Recovery targets reuse private active configuration without SSH account information' {
+    With-TestRuntime {
+        $config = Parse-Config '{"proxy_port":11080,"check":{"host":"service.example.edu","port":443},"forwards":[{"name":"private-name","host":"192.0.2.10","remote_port":22,"local_port":2222,"ssh_user":"private-user"},{"name":"tcp","host":"192.0.2.11","remote_port":80,"local_port":8080}]}'
+        Write-Runtime $config
+        $text = Get-Content (Join-Path $script:Runtime 'recovery-targets.json') -Raw
+        $targets = ($text | ConvertFrom-Json).targets
+        Assert-True ($targets.Count -eq 3 -and $targets[0].port -eq 443 -and -not $targets[0].ssh)
+        Assert-True ($targets[1].port -eq 22 -and $targets[1].ssh -and -not $targets[2].ssh)
+        Assert-True ($text -notmatch 'private-user|private-name|local_port')
+        Write-Runtime (Parse-Config '{"proxy_port":11080,"forwards":[]}')
+        $empty = Get-Content (Join-Path $script:Runtime 'recovery-targets.json') -Raw | ConvertFrom-Json
+        Assert-True ($empty.targets -is [array] -and $empty.targets.Count -eq 0)
+    }
+}
+Check 'Recovery status is read-only and exposes failures without claiming recovery' {
+    function Invoke-Docker {
+        param([string[]]$Arguments)
+        Assert-True ($Arguments[-2] -eq '/ecnu/recovery.js' -and $Arguments[-1] -eq 'status')
+        return '{"state":"recovering","summary":"已请求重建数据通道。"}'
+    }
+    Assert-True ((Get-RecoverySummary (New-ContainerFixture)) -eq '已请求重建数据通道。')
+    function Invoke-Docker { throw 'monitor missing' }
+    Assert-True ((Get-RecoverySummary (New-ContainerFixture)) -match '无法读取监控状态：monitor missing')
 }
 Write-Output "All $script:Passed checks passed."
