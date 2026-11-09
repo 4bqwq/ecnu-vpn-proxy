@@ -25,6 +25,21 @@ while IFS= read -r gateway; do
     ip rule add to "${gateway}/32" table 2
 done <<< "$docker_gateways"
 
+# Obtain a real address before aTrust starts, then keep it refreshed by TTL.
+# The bundled Node runtime avoids an additional package or image build.
+rm -f /run/ecnu-vpn-dns.ready
+ELECTRON_RUN_AS_NODE=1 /usr/share/sangfor/aTrust/aTrustTray /ecnu/vpn-dns.js &
+dns_pid=$!
+children+=("$dns_pid")
+while [[ ! -f /run/ecnu-vpn-dns.ready ]]; do
+    if ! kill -0 "$dns_pid" 2>/dev/null; then
+        wait "$dns_pid" || true
+        echo 'VPN DNS updater exited before providing an address; see its error above.' >&2
+        exit 1
+    fi
+    sleep 1
+done
+
 while IFS=$'\t' read -r local_port remote_host remote_port; do
     [[ -n "$local_port" ]] || continue
     ip rule add iif lo table 2 sport "$local_port"

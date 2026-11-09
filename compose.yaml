@@ -29,4 +29,5 @@ services:
       - ./.runtime/forwards.tsv:/ecnu/forwards.tsv:ro
       - ./container/entrypoint.sh:/ecnu/entrypoint.sh:ro
       - ./container/status.js:/ecnu/status.js:ro
+      - ./container/vpn-dns.js:/ecnu/vpn-dns.js:ro
     command: ["/bin/bash", "/ecnu/entrypoint.sh"]
